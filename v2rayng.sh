@@ -10,7 +10,6 @@ BACKUP_MODE=0
 OLD_SERVER=""
 DOMAIN=""
 SSL_URL=""
-GRE_DOMAIN="gre1.masterboot.net"
 
 show_menu() {
     echo "======================================"
@@ -72,13 +71,13 @@ transfer_from_old_server() {
     echo "Database and SSL files transferred and validated successfully."
 }
 
+# Installs a separate updater. It changes only local/remote inside gre1.
 install_gre_updater() {
     cat > /usr/local/sbin/update-gre-remote <<'UPDATER_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 CONFIG="/etc/netplan/gre.yaml"
-DOMAIN="gre1.masterboot.net"
 LOCK="/run/lock/update-gre-remote.lock"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -97,23 +96,25 @@ import ipaddress, sys
 try:
     ipaddress.IPv4Address(sys.argv[1])
 except Exception:
-    raise SystemExit("ERROR: remote address must be a valid IPv4 address")
+    raise SystemExit("ERROR: remote must be a valid IPv4 address")
 PY
 
-command -v getent >/dev/null 2>&1 || { echo "ERROR: getent not found."; exit 1; }
-command -v netplan >/dev/null 2>&1 || { echo "ERROR: netplan not found."; exit 1; }
-[[ -f "$CONFIG" ]] || { echo "ERROR: $CONFIG not found."; exit 1; }
-
-LOCAL_IP="$(getent ahostsv4 "$DOMAIN" | awk 'NR==1 {print $1; exit}')"
-[[ -n "$LOCAL_IP" ]] || { echo "ERROR: Could not resolve $DOMAIN to IPv4."; exit 1; }
+LOCAL_IP="$(ip -4 route get 8.8.8.8 | awk '{print $7; exit}')"
+if [[ -z "$LOCAL_IP" ]]; then
+    echo "ERROR: Could not detect local IPv4 address."
+    exit 1
+fi
 
 python3 - "$LOCAL_IP" <<'PY'
 import ipaddress, sys
 try:
     ipaddress.IPv4Address(sys.argv[1])
 except Exception:
-    raise SystemExit("ERROR: DNS did not return a valid IPv4 address")
+    raise SystemExit("ERROR: detected local address is not a valid IPv4 address")
 PY
+
+command -v netplan >/dev/null 2>&1 || { echo "ERROR: netplan not found."; exit 1; }
+[[ -f "$CONFIG" ]] || { echo "ERROR: $CONFIG not found."; exit 1; }
 
 mkdir -p /run/lock
 exec 9>"$LOCK"
@@ -124,12 +125,12 @@ BACKUP="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
 cleanup() { rm -f "$TMP"; }
 trap cleanup EXIT
 
-# Change only local/remote keys inside the gre1 tunnel block.
+# Find the gre1 block and replace exactly one local and one remote key.
 python3 - "$CONFIG" "$TMP" "$LOCAL_IP" "$REMOTE_IP" <<'PY'
 import re, sys
 src, dst, local_ip, remote_ip = sys.argv[1:]
-text = open(src, encoding="utf-8").read()
-lines = text.splitlines(keepends=True)
+with open(src, encoding="utf-8") as f:
+    lines = f.readlines()
 
 start = None
 for i, line in enumerate(lines):
@@ -137,32 +138,30 @@ for i, line in enumerate(lines):
         start = i
         break
 if start is None:
-    raise SystemExit("ERROR: gre1 tunnel block not found")
+    raise SystemExit("ERROR: gre1 block not found in netplan file")
 
 base_indent = len(lines[start]) - len(lines[start].lstrip())
 end = len(lines)
 for i in range(start + 1, len(lines)):
-    stripped = lines[i].strip()
-    if not stripped or stripped.startswith("#"):
+    if not lines[i].strip() or lines[i].lstrip().startswith("#"):
         continue
     indent = len(lines[i]) - len(lines[i].lstrip())
     if indent <= base_indent:
         end = i
         break
 
-block = lines[start:end]
 counts = {"local": 0, "remote": 0}
 for i in range(start + 1, end):
-    match = re.match(r'^(\s*)(local|remote):\s*.*?(\r?\n)?$', lines[i])
-    if match:
-        key = match.group(2)
+    m = re.match(r'^(\s*)(local|remote):\s*.*?(\r?\n)?$', lines[i])
+    if m:
+        key = m.group(2)
         counts[key] += 1
         value = local_ip if key == "local" else remote_ip
         newline = "\n" if lines[i].endswith("\n") else ""
-        lines[i] = f"{match.group(1)}{key}: {value}{newline}"
+        lines[i] = f"{m.group(1)}{key}: {value}{newline}"
 
 if counts != {"local": 1, "remote": 1}:
-    raise SystemExit(f"ERROR: expected exactly one local and one remote in gre1 block; found {counts}")
+    raise SystemExit(f"ERROR: expected exactly one local and one remote in gre1; found {counts}")
 
 with open(dst, "w", encoding="utf-8") as f:
     f.writelines(lines)
@@ -238,28 +237,19 @@ rm -f /tmp/get-docker.sh
 
 echo
 echo "===== Configure GRE Tunnel ====="
-LOCAL_IP="$(getent ahostsv4 "$GRE_DOMAIN" | awk 'NR==1 {print $1; exit}')"
+# Keep the original server-side IP detection method from v2ray.sh.
+LOCAL_IP="$(ip -4 route get 8.8.8.8 | awk '{print $7; exit}')"
 if [[ -z "$LOCAL_IP" ]]; then
-    echo "ERROR: Could not resolve $GRE_DOMAIN to an IPv4 address."
+    echo "ERROR: Could not detect local IPv4 address."
     exit 1
 fi
-python3 - "$LOCAL_IP" <<'PY'
-import ipaddress, sys
-try:
-    ipaddress.IPv4Address(sys.argv[1])
-except Exception:
-    raise SystemExit("ERROR: GRE domain did not resolve to a valid IPv4 address.")
-PY
-echo "Detected Linux public IP from $GRE_DOMAIN: $LOCAL_IP"
+echo "Detected Local IP: $LOCAL_IP"
 
-read -r -p "Enter MikroTik public IPv4 (Remote): " REMOTE_IP
-python3 - "$REMOTE_IP" <<'PY'
-import ipaddress, sys
-try:
-    ipaddress.IPv4Address(sys.argv[1])
-except Exception:
-    raise SystemExit("ERROR: Enter a valid MikroTik public IPv4 address.")
-PY
+read -r -p "Enter Iran Public IP (Remote): " REMOTE_IP
+if [[ ! "$REMOTE_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    echo "ERROR: Invalid remote IP/hostname."
+    exit 1
+fi
 
 mkdir -p /etc/netplan
 if [[ -f /etc/netplan/gre.yaml ]]; then
@@ -283,7 +273,7 @@ network:
 EOF2
 
 install_gre_updater
-echo "Applying initial GRE configuration..."
+echo "Applying netplan..."
 netplan generate
 netplan apply
 
@@ -369,12 +359,11 @@ echo "Installation completed successfully!"
 echo "======================================"
 echo "GRE Local IP : $LOCAL_IP"
 echo "GRE Remote IP: $REMOTE_IP"
-echo "GRE Domain   : $GRE_DOMAIN"
 echo "Tunnel IP    : 10.10.30.2/30"
-echo "GRE Updater  : /usr/local/sbin/update-gre-remote"
 echo "SSL Domain   : ${DOMAIN:-Not installed}"
 echo "SNMP         : Configured"
 echo "3X-UI        : Started"
+echo "GRE Updater  : /usr/local/sbin/update-gre-remote"
 echo "======================================"
 echo
 echo "Installation completed."
