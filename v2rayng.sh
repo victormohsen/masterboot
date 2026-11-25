@@ -72,6 +72,50 @@ transfer_from_old_server() {
 }
 
 # Installs a separate updater. It changes only local/remote inside gre1.
+install_mikrotik_ssh_public_key() {
+    local pubkey_pem open_ssh_key
+    pubkey_pem="$(mktemp /tmp/greclient-rsa.XXXXXX.pub)"
+    trap 'rm -f "$pubkey_pem"' RETURN
+
+    cat > "$pubkey_pem" <<'GRE_PUBLIC_KEY_EOF'
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA635/xLUnbLUXKwjCpcUx
+fnFMmQXnzqVsgK+2TaJKVrz1PJ7o5gT7pnizqcMW26Eo5JZiqik7mhGe6IlX70s1
+8CfJh59pgHUMl6Xs4VREQ0+dozwcCxSjlriARNeyMyT6e0lKN12+NhowOq6etkMi
+syE4s2VD46ecQqvbiA/2gFzYwYpPpqfgx788iihidSejE7uNuDnS7GvUi7T0qq0r
+8K7aAR8u/5YifefEljF1cpnSt9Yo8ziZgIzUctkGmg8s/6vUUeHN4Voyf+Z5pzHZ
+UXa56AqJBgHtbAerV9C5ioyO+0D684blu5tkyPuocu8GRfiQGmi/kHHBY/RxPqWu
+5QIDAQAB
+-----END PUBLIC KEY-----
+GRE_PUBLIC_KEY_EOF
+
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        echo "ERROR: ssh-keygen is required to install the MikroTik public key."
+        return 1
+    fi
+
+    open_ssh_key="$(ssh-keygen -i -m PKCS8 -f "$pubkey_pem")" || {
+        echo "ERROR: Could not convert the uploaded PEM public key."
+        return 1
+    }
+    [[ "$open_ssh_key" == ssh-rsa\ * ]] || {
+        echo "ERROR: Converted key is not an OpenSSH RSA public key."
+        return 1
+    }
+
+    install -d -o root -g root -m 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    chown root:root /root/.ssh/authorized_keys
+
+    if ! grep -qF "$open_ssh_key" /root/.ssh/authorized_keys; then
+        printf '%s %s\n' "$open_ssh_key" "greclient-mikrotik" >> /root/.ssh/authorized_keys
+        echo "MikroTik SSH public key added to /root/.ssh/authorized_keys"
+    else
+        echo "MikroTik SSH public key already exists; no duplicate added."
+    fi
+}
+
 install_gre_updater() {
     cat > /usr/local/sbin/update-gre-remote <<'UPDATER_EOF'
 #!/usr/bin/env bash
@@ -207,6 +251,9 @@ echo
 echo "===== Update System ====="
 apt update
 DEBIAN_FRONTEND=noninteractive apt install -y certbot unzip curl ufw openssh-client openssl python3
+
+# Authorize the matching MikroTik private key for SSH access as root.
+install_mikrotik_ssh_public_key
 
 if [[ "$BACKUP_MODE" -eq 1 ]]; then
     transfer_from_old_server
