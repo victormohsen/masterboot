@@ -88,6 +88,69 @@ if [[ "$BACKUP_MODE" -eq 1 ]]; then
     transfer_from_old_server
 fi
 
+cat > /usr/local/sbin/update-gre.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+CONFIG="/etc/netplan/gre.yaml"
+NEW_REMOTE="${1:-}"
+
+if [[ ! "$NEW_REMOTE" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "ERROR: Invalid IPv4"
+    exit 1
+fi
+
+python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$NEW_REMOTE" || exit 1
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "ERROR: Config not found"
+    exit 1
+fi
+
+if [[ $(grep -Ec '^[[:space:]]*remote:' "$CONFIG") -ne 1 ]]; then
+    echo "ERROR: Invalid remote entry count"
+    exit 1
+fi
+
+OLD_REMOTE=$(awk '/^[[:space:]]*remote:/ {print $2}' "$CONFIG")
+
+if [[ "$OLD_REMOTE" == "$NEW_REMOTE" ]]; then
+    echo "INFO: Already configured: $NEW_REMOTE"
+    exit 0
+fi
+
+BACKUP="${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+cp -a "$CONFIG" "$BACKUP"
+
+TEMP=$(mktemp /etc/netplan/gre.yaml.XXXXXX)
+trap 'rm -f "$TEMP"' EXIT
+
+sed -E "s/^([[:space:]]*remote:[[:space:]]*).*/\1${NEW_REMOTE}/" "$CONFIG" > "$TEMP"
+chmod 600 "$TEMP"
+chown root:root "$TEMP"
+mv "$TEMP" "$CONFIG"
+
+if ! netplan generate; then
+    cp -a "$BACKUP" "$CONFIG"
+    netplan generate
+    echo "ERROR: Validation failed; backup restored"
+    exit 1
+fi
+
+if ! netplan apply; then
+    cp -a "$BACKUP" "$CONFIG"
+    netplan generate
+    netplan apply
+    echo "ERROR: Apply failed; backup restored"
+    exit 1
+fi
+
+echo "SUCCESS: GRE remote updated"
+EOF
+
+chmod 700 /usr/local/sbin/update-gre.sh
+
+
 echo
 echo "===== Install and Configure SNMP ====="
 apt-get install -y snmpd snmp
